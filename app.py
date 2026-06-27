@@ -1,48 +1,19 @@
 import os
-import sys
-import pickle
-import types
 import numpy as np
-import xgboost as xgb
+import onnxruntime as rt
 from flask import Flask, request, jsonify, render_template_string
-
-# --- WORKAROUND FOR VERCEL SIZE LIMIT ---
-# Mock scikit-learn modules so the pickle file loads without needing the heavy sklearn package
-if "sklearn" not in sys.modules:
-    mock_sklearn = types.ModuleType("sklearn")
-    mock_sklearn.utils = types.ModuleType("sklearn.utils")
-    mock_sklearn.utils.validation = types.ModuleType("sklearn.utils.validation")
-    
-    # Create dummy classes to fool the unpickler
-    class Dummy: pass
-    mock_sklearn.base = types.ModuleType("sklearn.base")
-    mock_sklearn.base.BaseEstimator = Dummy
-    mock_sklearn.base.ClassifierMixin = Dummy
-    
-    sys.modules["sklearn"] = mock_sklearn
-    sys.modules["sklearn.base"] = mock_sklearn.base
-    sys.modules["sklearn.utils"] = mock_sklearn.utils
-    sys.modules["sklearn.utils.validation"] = mock_sklearn.utils.validation
-
-# Also mock pandas if required by older xgboost unpicklers
-if "pandas" not in sys.modules:
-    sys.modules["pandas"] = types.ModuleType("pandas")
-# ----------------------------------------
 
 app = Flask(__name__)
 
-# Load the model
-MODEL_PATH = os.path.join(os.path.dirname(__file__), "model (4).pkl")
-model = None
+# Load the lightweight ONNX model
+MODEL_PATH = os.path.join(os.path.dirname(__file__), "model.onnx")
+sess = None
+input_name = None
 
 if os.path.exists(MODEL_PATH):
-    with open(MODEL_PATH, "rb") as f:
-        raw_model = pickle.load(f)
-        # Extract the native booster core to run lightning-fast serverless predictions
-        if hasattr(raw_model, "get_booster"):
-            model = raw_model.get_booster()
-        else:
-            model = raw_model
+    # Initialize the ONNX inference engine
+    sess = rt.InferenceSession(MODEL_PATH)
+    input_name = sess.get_inputs()[0].name
 
 CATEGORICAL_MAPPINGS = {
     "Gender": {"Male": 0, "Female": 1},
@@ -76,7 +47,7 @@ HTML_TEMPLATE = """
                 </div>
                 <div>
                     <h1 class="text-xl font-bold text-slate-900">HealthPredict AI</h1>
-                    <p class="text-xs text-slate-500">Serverless XGBoost Engine</p>
+                    <p class="text-xs text-slate-500">Optimized Serverless Engine</p>
                 </div>
             </div>
             <span class="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-emerald-100 text-emerald-800">
@@ -156,7 +127,7 @@ HTML_TEMPLATE = """
                     </div>
                     <div id="resultsCard" class="hidden space-y-6">
                         <div class="bg-indigo-50 border border-indigo-100 rounded-xl p-5 text-center">
-                            <span class="text-xs font-semibold uppercase tracking-wider text-indigo-600 block mb-1">Class Prediction Verdict</span>
+                            <span class="text-xs font-semibold uppercase tracking-wider text-indigo-600 block mb-1">Prediction Verdict</span>
                             <div id="predictionValue" class="text-3xl font-extrabold text-indigo-900">--</div>
                         </div>
                         <div>
@@ -170,7 +141,7 @@ HTML_TEMPLATE = """
     </main>
 
     <footer class="bg-white border-t border-slate-200 py-4 text-center text-xs text-slate-500">
-        &copy; 2026 HealthPredict AI. Running on Cloud Environment.
+        &copy; 2026 HealthPredict AI.
     </footer>
 
     <script>
@@ -219,26 +190,32 @@ def home():
 
 @app.route("/predict", methods=["POST"])
 def predict():
-    if model is None:
-        return jsonify({"success": False, "error": "Model not available."}), 500
+    if sess is None:
+        return jsonify({"success": False, "error": "ONNX Model Session not loaded."}), 500
     try:
         data = request.get_json()
         features = [
-            int(data["Age"]),
-            CATEGORICAL_MAPPINGS["Gender"][data["Gender"]],
-            CATEGORICAL_MAPPINGS["Blood Type"][data["Blood Type"]],
-            CATEGORICAL_MAPPINGS["Medical Condition"][data["Medical Condition"]],
-            CATEGORICAL_MAPPINGS["Hospital"][data["Hospital"]],
-            CATEGORICAL_MAPPINGS["Insurance Provider"][data["Insurance Provider"]],
+            float(data["Age"]),
+            float(CATEGORICAL_MAPPINGS["Gender"][data["Gender"]]),
+            float(CATEGORICAL_MAPPINGS["Blood Type"][data["Blood Type"]]),
+            float(CATEGORICAL_MAPPINGS["Medical Condition"][data["Medical Condition"]]),
+            float(CATEGORICAL_MAPPINGS["Hospital"][data["Hospital"]]),
+            float(CATEGORICAL_MAPPINGS["Insurance Provider"][data["Insurance Provider"]]),
             float(data["Billing Amount"]),
-            CATEGORICAL_MAPPINGS["Admission Type"][data["Admission Type"]],
-            CATEGORICAL_MAPPINGS["Medication"][data["Medication"]]
+            float(CATEGORICAL_MAPPINGS["Admission Type"][data["Admission Type"]]),
+            float(CATEGORICAL_MAPPINGS["Medication"][data["Medication"]])
         ]
         
-        # Predict using light native DMatrix 
-        dmatrix = xgb.DMatrix(np.array([features], dtype=np.float32))
-        probabilities = model.predict(dmatrix)[0].tolist()
-        prediction = int(np.argmax(probabilities))
+        # Format input data explicitly as a 2D float32 numpy array for ONNX
+        input_data = np.array([features], dtype=np.float32)
+        
+        # Run inference using ONNX Runtime
+        raw_pred = sess.run(None, {input_name: input_data})
+        
+        # ONNX outputs prediction class index and continuous classification probabilities dictionary list
+        prediction = int(raw_pred[0][0])
+        prob_dict = raw_pred[1][0]
+        probabilities = [prob_dict[k] for k in sorted(prob_dict.keys())]
         
         return jsonify({"success": True, "prediction": prediction, "probabilities": probabilities})
     except Exception as e:
